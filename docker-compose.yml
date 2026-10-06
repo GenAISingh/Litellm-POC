@@ -1,0 +1,121 @@
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: litellm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: litellm-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  litellm:
+    # v1.104.0, latest stable on Oct 6, 2026; cosign signature verified against LiteLLM's key.
+    # Previous image (rollback): ghcr.io/berriai/litellm-database:main-stable@sha256:b398150d008dd36a57fa094314b6cd428d832c5264094fd3cd455b93d640ab11
+    image: ghcr.io/berriai/litellm:v1.104.0@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839
+    container_name: litellm-proxy
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    ports:
+      - "127.0.0.1:4000:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      STORE_MODEL_IN_DB: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GEMMA_API_KEY: ${GEMMA_API_KEY}
+      GEMMA_API_BASE: ${GEMMA_API_BASE}
+      OTEL_EXPORTER: ${OTEL_EXPORTER}
+      OTEL_ENDPOINT: ${OTEL_ENDPOINT}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME}
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES}
+    volumes:
+      - ./litellm-config.yml:/app/config.yaml:ro
+      - ./router.json:/app/router.json:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "1"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.155.0@sha256:4935caa35e9a4cb387e35732e8fb22b2b5759af8d12e7043357f03837f6e8df5
+    container_name: litellm-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    environment:
+      AZURE_MONITOR_CONNECTION_STRING: ${AZURE_MONITOR_CONNECTION_STRING}
+
+  chainlit:
+    build: ./chainlit_app
+    container_name: litellm-chainlit
+    restart: unless-stopped
+    depends_on:
+      litellm:
+        condition: service_started
+    environment:
+      LITELLM_BASE_URL: http://litellm:4000
+      # Virtual key for the UI, not the master key. It can only be created once the proxy
+      # is running, so it is optional here; the UI explains what to do when it is missing.
+      LITELLM_API_KEY: ${CHAINLIT_LITELLM_API_KEY:-}
+      CHAINLIT_AUTH_SECRET: ${CHAINLIT_AUTH_SECRET}
+      APP_USERNAME: ${APP_USERNAME}
+      APP_PASSWORD: ${APP_PASSWORD}
+      GEMMA_API_BASE: ${GEMMA_API_BASE}
+      CHAINLIT_URL: https://${GATEWAY_HOSTNAME:?Set GATEWAY_HOSTNAME in .env}
+
+  caddy:
+    image: caddy:2
+    container_name: litellm-caddy
+    restart: unless-stopped
+    depends_on:
+      - chainlit
+    environment:
+      GATEWAY_HOSTNAME: ${GATEWAY_HOSTNAME:?Set GATEWAY_HOSTNAME in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

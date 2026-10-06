@@ -1,0 +1,6 @@
+# Pinned versions. An unpinned rebuild on Oct 6, 2026 pulled traceloop-sdk 0.62.4 (via chainlit's
+# literalai dependency), which imports requests without declaring it, so Chainlit failed to start.
+# chainlit 2.11.1 is the version .chainlit/config.toml was generated with.
+chainlit==2.11.1
+httpx==0.28.1
+requests==2.34.2

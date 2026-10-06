@@ -1,0 +1,41 @@
+{
+  "encoder_type": "openai",
+  "encoder_name": "text-embedding",
+  "routes": [
+    {
+      "name": "groq-gpt-oss-120b",
+      "utterances": [
+        "write a python script that parses this file",
+        "debug this stack trace",
+        "refactor this function",
+        "how do I implement a binary search in [language]"
+      ],
+      "description": "coding and software tasks -> bigger open model (Groq)",
+      "score_threshold": 0.5,
+      "metadata": {}
+    },
+    {
+      "name": "groq-qwen3",
+      "utterances": [
+        "analyze the trade-offs between these architectures",
+        "explain the reasoning step by step",
+        "prove that this algorithm is correct"
+      ],
+      "description": "deep analytical / reasoning tasks -> reasoning model (Groq)",
+      "score_threshold": 0.5,
+      "metadata": {}
+    },
+    {
+      "name": "groq-gpt-oss-20b",
+      "utterances": [
+        "what time is it in Tokyo",
+        "summarize this paragraph",
+        "what is the capital of France",
+        "thanks, that's all"
+      ],
+      "description": "simple factual / chit-chat -> cheap fast model (Groq)",
+      "score_threshold": 0.5,
+      "metadata": {}
+    }
+  ]
+}

@@ -1,0 +1,450 @@
+# =============================================================================
+# LiteLLM Routing POC: config.yaml (LiteLLM v1.104.0)
+# -----------------------------------------------------------------------------
+# Demonstrates LiteLLM's routing techniques across four backends:
+#   - Azure OpenAI       gpt-5.4-mini + text-embedding-3-large      -> mid tier
+#   - Azure AI Foundry   Claude Opus 4.6                            -> top tier
+#   - Groq               gpt-oss-20b / gpt-oss-120b / qwen3.8-27b   -> cheap, strong, reasoning
+#   - Self-hosted vLLM   Gemma 4 26B                                -> free (infra cost only)
+#
+# Techniques shown (see README "LiteLLM routing strategies reference"):
+#   - Content-aware routers: complexity, quality, adaptive (beta), semantic (deprecated)
+#   - Tag-based routing (free vs paid)
+#   - Load balancing: simple-shuffle (global), latency-based routing group
+#   - Deployment ordering (priority failover) and traffic mirroring (silent model)
+#   - Reliability: health-check routing, fallbacks (3 kinds), retries, cooldowns,
+#     timeouts, pre-call checks, provider budgets
+#
+# All secrets come from the environment (os.environ/...); see .env.example.
+# Azure deployment names are written directly in `model:` (azure/<deployment>).
+#
+# PRICING: costs come from LiteLLM's built-in price list. Azure entries set
+# `base_model` so LiteLLM can find the right list entry for a deployment name.
+# Only Gemma has a manual price ($0, self-hosted). If Tungsten pays negotiated
+# rates, add input_cost_per_token / output_cost_per_token per deployment.
+# =============================================================================
+
+model_list:
+
+  # ===========================================================================
+  # 1. BASE MODELS (the deployments the routers choose between)
+  # ===========================================================================
+
+  # ---- Azure OpenAI: gpt-5.4-mini (mid tier) --------------------------------
+  - model_name: azure-gpt-mini
+    litellm_params:
+      model: azure/gpt-5.4-mini                 # azure/<deployment name>
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+      api_base: os.environ/AZURE_OPENAI_ENDPOINT
+      api_version: os.environ/AZURE_OPENAI_API_VERSION
+      rpm: 600
+      tpm: 80000
+    model_info:
+      base_model: azure/gpt-5.4-mini            # price-list entry for cost + max tokens
+      adaptive_router_preferences:
+        quality_tier: 2
+        strengths: ["general", "writing", "code_generation"]
+      litellm_routing_preferences:              # used by quality-router
+        quality_tier: 2
+
+  # Second Azure deployment (another region or key) for load balancing.
+  # Uncomment and add AZURE_OPENAI_*_2 to .env to balance across two endpoints.
+  # - model_name: azure-gpt-mini
+  #   litellm_params:
+  #     model: azure/gpt-5.4-mini
+  #     api_key: os.environ/AZURE_OPENAI_API_KEY_2
+  #     api_base: os.environ/AZURE_OPENAI_ENDPOINT_2
+  #     api_version: os.environ/AZURE_OPENAI_API_VERSION_2
+  #     rpm: 600
+  #     tpm: 80000
+  #   model_info:
+  #     base_model: azure/gpt-5.4-mini
+
+  # ---- Groq: fast, cheap open models ----------------------------------------
+  # Model IDs change often; check https://console.groq.com/docs/models.
+  - model_name: groq-gpt-oss-20b
+    litellm_params:
+      model: groq/openai/gpt-oss-20b            # cheapest + fastest
+      api_key: os.environ/GROQ_API_KEY
+      rpm: 1000
+      tpm: 200000
+    model_info:
+      adaptive_router_preferences:
+        quality_tier: 1                         # scale is 1-3 (1 = low, 3 = high)
+        strengths: ["factual_lookup", "general"]
+
+  - model_name: groq-gpt-oss-120b
+    litellm_params:
+      model: groq/openai/gpt-oss-120b           # bigger open model -> COMPLEX
+      api_key: os.environ/GROQ_API_KEY
+      rpm: 600
+      tpm: 150000
+    model_info:
+      adaptive_router_preferences:
+        quality_tier: 3
+        strengths: ["general", "writing", "code_generation"]
+      litellm_routing_preferences:              # quality-router: tier 3, cheaper of the two
+        quality_tier: 3
+        keywords: ["data pipeline"]             # "security" is claude-opus only (tier 4)
+
+  - model_name: groq-qwen3
+    litellm_params:
+      model: groq/qwen/qwen3.8-27b              # Groq reasoning model (qwen3.6 retired, Oct 2026)
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 180                              # reasoning answers can run past the 60 s default
+      rpm: 400
+      tpm: 100000
+    model_info:
+      adaptive_router_preferences:
+        quality_tier: 3
+        strengths: ["analytical_reasoning", "technical_design"]
+      litellm_routing_preferences:              # quality-router: tier 3, pricier, loses ties
+        quality_tier: 3
+        keywords: ["data pipeline", "deep reasoning"]
+
+  # ---- Azure embedding (used by the semantic router) -------------------------
+  - model_name: text-embedding
+    litellm_params:
+      model: azure/text-embedding-3-large       # azure/<deployment name>
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+      api_base: os.environ/AZURE_OPENAI_ENDPOINT
+      api_version: os.environ/AZURE_OPENAI_API_VERSION
+    model_info:
+      base_model: azure/text-embedding-3-large
+      mode: embedding                           # health checks call the embeddings API
+
+  # ---- Claude Opus 4.6 on Azure AI Foundry (most capable, most expensive) ----
+  - model_name: claude-opus
+    litellm_params:
+      model: azure_ai/claude-opus-4-6-2         # Claude on Azure = azure_ai/, not azure/
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+      api_base: os.environ/AZURE_OPENAI_ENDPOINT
+      timeout: 180                              # long reasoning answers
+      rpm: 200
+      tpm: 40000
+    model_info:
+      base_model: azure_ai/claude-opus-4-6      # deployment name "-2" is not in the price list
+      disable_background_health_check: true     # most expensive model: not probed every 5 min
+      litellm_routing_preferences:              # quality-router: tier 4 (highest)
+        quality_tier: 4
+        keywords: ["legal", "contract", "production incident", "security"]
+
+  # ---- Gemma 4 26B: self-hosted vLLM, OpenAI-compatible ----------------------
+  # Auth header is X-API-Key (not Bearer); model is the vLLM model id.
+  - model_name: gemma
+    litellm_params:
+      model: openai/google/gemma-4-26B-A4B-it   # vLLM model id (from /v1/models)
+      api_key: os.environ/GEMMA_API_KEY
+      api_base: os.environ/GEMMA_API_BASE       # .../v1 (LiteLLM adds /chat/completions)
+      extra_headers: {"X-API-Key": "os.environ/GEMMA_API_KEY"}
+      # Fail fast when the self-hosted server is down, so routers fall back in
+      # seconds instead of waiting the global 60 s timeout.
+      timeout: 10
+      rpm: 600
+      tpm: 100000
+    model_info:
+      # Self-hosted: no per-token vendor cost (GPU is a fixed cost), so $0.
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+      litellm_routing_preferences:              # quality-router
+        quality_tier: 1
+
+  # ===========================================================================
+  # 2. COMPLEXITY ROUTER ("cheap when good enough"). Call: smart-router
+  #    Local heuristic scores each prompt -> tier -> model. The decision is
+  #    returned in x-litellm-complexity-router-tier / -score / -cause headers.
+  # ===========================================================================
+  - model_name: smart-router
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        tiers:
+          SIMPLE: gemma                         # easy chat -> free, self-hosted
+          MEDIUM: azure-gpt-mini
+          COMPLEX: groq-gpt-oss-120b
+          REASONING: claude-opus                # falls back to groq-qwen3 (see fallbacks)
+        # Tuned so short-but-hard prompts are not rated SIMPLE.
+        tier_boundaries:
+          simple_medium: 0.12
+          medium_complex: 0.30
+          complex_reasoning: 0.50
+        token_thresholds:
+          simple: 8                             # only ultra-short prompts penalized
+          complex: 400
+        # Two or more of these force REASONING (Claude Opus, the most expensive
+        # model), so keep them specific. Common words like "analyze" were removed.
+        reasoning_keywords:
+          - prove
+          - proof
+          - theorem
+          - undecidable
+          - derive
+          - "step by step"
+          - reason through
+          - explain why
+          - rigorous
+          - formally
+      complexity_router_default_model: azure-gpt-mini
+    model_info:
+      disable_background_health_check: true     # virtual router; tier models are probed directly
+
+  # ===========================================================================
+  # 3. ADAPTIVE ROUTER [BETA] (learns quality vs cost from real traffic)
+  #    Needs Postgres. Call: adaptive-router. Header x-litellm-adaptive-router-model
+  #    shows what it picked.
+  # ===========================================================================
+  - model_name: adaptive-router
+    litellm_params:
+      model: auto_router/adaptive_router
+      adaptive_router_config:                   # must be inside litellm_params
+        available_models: ["groq-gpt-oss-20b", "azure-gpt-mini", "groq-gpt-oss-120b"]
+        weights:
+          quality: 0.7                          # 0.3 = cost first ... 0.9 = quality first
+          cost: 0.3
+    model_info:
+      disable_background_health_check: true
+
+  # ===========================================================================
+  # 4. QUALITY ROUTER (target quality tier + keyword override). Call: quality-router
+  #    Reuses the complexity classification, maps tier -> quality via
+  #    complexity_to_quality, then picks a model whose
+  #    model_info.litellm_routing_preferences.quality_tier matches. A keyword in
+  #    the prompt overrides it (e.g. "legal" / "security" -> Claude Opus).
+  #    Decision returned in x-litellm-quality-router-* headers.
+  # ===========================================================================
+  - model_name: quality-router
+    litellm_params:
+      model: auto_router/quality_router
+      quality_router_default_model: gemma
+      quality_router_config:
+        available_models: ["gemma", "azure-gpt-mini", "groq-gpt-oss-120b", "groq-qwen3", "claude-opus"]
+        default_model: gemma
+        complexity_to_quality:
+          SIMPLE: 1
+          MEDIUM: 2
+          COMPLEX: 3
+          REASONING: 4
+        # Two tier-3 models (120b + qwen3) show the tie-break: highest tier, then cheapest.
+    model_info:
+      disable_background_health_check: true
+
+  # ===========================================================================
+  # 5. SEMANTIC ROUTER (route by meaning via embeddings). Call: semantic-router
+  #    DEPRECATED in LiteLLM: the complexity router's keyword_tier_rules with
+  #    semantic_keyword_matching replace it. Kept for comparison.
+  # ===========================================================================
+  - model_name: semantic-router
+    litellm_params:
+      model: auto_router/semantic_router_1
+      # Inline config (not auto_router_config_path): the path option makes the
+      # semantic_router library build its own OpenAI encoder (needs OPENAI_API_KEY);
+      # inline uses auto_router_embedding_model (Azure) instead.
+      auto_router_default_model: gemma
+      auto_router_embedding_model: text-embedding
+      # coding -> claude-opus, chat -> gemma (default: gemma)
+      auto_router_config: '{"routes":[{"name":"claude-opus","description":"coding and software engineering tasks","utterances":["how do I write a recursive function in python","debug this stack trace","refactor this function","write a SQL query to join two tables","fix this bug in my code"],"score_threshold":0.3},{"name":"gemma","description":"general chat and small talk","utterances":["how is your day going","tell me a joke","what is a good name for a pet goldfish","lets just chat","what do you think about coffee"],"score_threshold":0.3}]}'
+    model_info:
+      disable_background_health_check: true
+
+  # ===========================================================================
+  # 6. TAG-BASED ROUTING (free vs paid). Call: chat-tiered
+  #    Send "tags": ["paid"] in the body or the x-litellm-tags: paid header.
+  # ===========================================================================
+  - model_name: chat-tiered
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      tags: ["free", "default"]                 # "default" catches untagged requests
+  - model_name: chat-tiered
+    litellm_params:
+      model: azure/gpt-5.4-mini
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+      api_base: os.environ/AZURE_OPENAI_ENDPOINT
+      api_version: os.environ/AZURE_OPENAI_API_VERSION
+      tags: ["paid"]
+    model_info:
+      base_model: azure/gpt-5.4-mini
+
+  # ===========================================================================
+  # 7. LOAD-BALANCED GROUP (Groq vs Azure under one name). Call: cheap-chat
+  #    In the "latency-sensitive" routing group below, so each request goes to
+  #    whichever deployment answered fastest recently. (Weights would only apply
+  #    under simple-shuffle, so none are set.)
+  # ===========================================================================
+  - model_name: cheap-chat
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: cheap-chat
+    litellm_params:
+      model: azure/gpt-5.4-mini
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+      api_base: os.environ/AZURE_OPENAI_ENDPOINT
+      api_version: os.environ/AZURE_OPENAI_API_VERSION
+    model_info:
+      base_model: azure/gpt-5.4-mini
+
+  # ===========================================================================
+  # 8. DEPLOYMENT ORDERING (priority failover inside one model group). Call: gpt-priority
+  #    order 1 (Azure) serves every request; order 2 (Groq) is used only when
+  #    order 1 fails. The production plan's primary/backup pattern.
+  # ===========================================================================
+  - model_name: gpt-priority
+    litellm_params:
+      model: azure/gpt-5.4-mini
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+      api_base: os.environ/AZURE_OPENAI_ENDPOINT
+      api_version: os.environ/AZURE_OPENAI_API_VERSION
+      order: 1                                  # primary
+    model_info:
+      base_model: azure/gpt-5.4-mini
+  - model_name: gpt-priority
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      order: 2                                  # backup, tried only when order 1 fails
+
+  # ===========================================================================
+  # 9. TRAFFIC MIRRORING (silent experiment). Call: mirror-demo
+  #    Users get the Azure answer; each request is also sent in the background to
+  #    the cheap Groq model to compare cost and latency on real prompts. Mirrored
+  #    calls are billed too. On its own model group because LiteLLM's background
+  #    health check (seen on v1.89.3; the v1.104.0 code looks the same) forwards
+  #    silent_model to Azure, which rejects it and marks the deployment unhealthy.
+  # ===========================================================================
+  - model_name: mirror-demo
+    litellm_params:
+      model: azure/gpt-5.4-mini
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+      api_base: os.environ/AZURE_OPENAI_ENDPOINT
+      api_version: os.environ/AZURE_OPENAI_API_VERSION
+      silent_model: groq-gpt-oss-20b            # mirror every request here
+    model_info:
+      base_model: azure/gpt-5.4-mini
+      disable_background_health_check: true     # see note above
+
+
+# =============================================================================
+# ROUTER SETTINGS: global routing strategy + reliability
+# =============================================================================
+router_settings:
+
+  # ---- GLOBAL LOAD-BALANCING STRATEGY ---------------------------------------
+  # simple-shuffle = lowest overhead, LiteLLM's recommended default. Alternatives:
+  #   least-busy | usage-based-routing | usage-based-routing-v2 |
+  #   latency-based-routing (add routing_strategy_args: {ttl, lowest_latency_buffer}) |
+  #   cost-based-routing
+  routing_strategy: simple-shuffle
+
+  # ---- shared state (Redis) for rate limits, cooldowns, budgets, latency data -
+  redis_host: os.environ/REDIS_HOST
+  redis_port: os.environ/REDIS_PORT
+  redis_password: os.environ/REDIS_PASSWORD
+
+  # ---- pre-call checks (needed for context_window_fallbacks + region filter) -
+  enable_pre_call_checks: true
+
+  # ---- provider budget routing: daily spend caps per provider (needs Redis) ---
+  # When a provider's budget for the period is used up, the router stops sending
+  # it traffic. Gemma (self-hosted, $0) is intentionally uncapped.
+  provider_budget_config:
+    groq:
+      budget_limit: 15                          # USD
+      time_period: 1d
+    azure:                                      # gpt-5.4-mini + embeddings
+      budget_limit: 20
+      time_period: 1d
+    azure_ai:                                   # Claude Opus, most of the cost
+      budget_limit: 30
+      time_period: 1d
+
+  # ---- tag-based routing (section 6) ----------------------------------------
+  enable_tag_filtering: true
+
+  # ---- retries --------------------------------------------------------------
+  num_retries: 3
+  retry_after: 5
+  retry_policy:
+    BadRequestErrorRetries: 1
+    AuthenticationErrorRetries: 0
+    TimeoutErrorRetries: 0                      # a timed-out deployment goes straight to its fallback
+    RateLimitErrorRetries: 3
+    ContentPolicyViolationErrorRetries: 2
+
+  # ---- cooldowns ------------------------------------------------------------
+  allowed_fails: 2
+  cooldown_time: 30
+  allowed_fails_policy:
+    RateLimitErrorAllowedFails: 100
+    ContentPolicyViolationErrorAllowedFails: 1000
+
+  # ---- fallbacks (to another model group) ------------------------------------
+  fallbacks:
+    - {"smart-router": ["azure-gpt-mini", "groq-gpt-oss-120b"]}
+    - {"azure-gpt-mini": ["groq-gpt-oss-120b", "groq-gpt-oss-20b"]}
+    - {"groq-gpt-oss-20b": ["azure-gpt-mini", "groq-gpt-oss-120b"]}
+    - {"groq-gpt-oss-120b": ["azure-gpt-mini"]}
+    - {"groq-qwen3": ["groq-gpt-oss-120b", "azure-gpt-mini"]}
+    - {"gemma": ["azure-gpt-mini", "groq-gpt-oss-20b"]}
+    - {"claude-opus": ["groq-qwen3", "gemma"]}  # REASONING tier backup
+    - {"quality-router": ["azure-gpt-mini"]}
+    - {"semantic-router": ["azure-gpt-mini"]}
+    - {"adaptive-router": ["azure-gpt-mini"]}
+    - {"chat-tiered": ["azure-gpt-mini"]}
+    - {"mirror-demo": ["azure-gpt-mini"]}
+    - {"cheap-chat": ["groq-gpt-oss-120b"]}     # both deployments failed
+    - {"gpt-priority": ["groq-gpt-oss-20b"]}    # both order levels failed
+  context_window_fallbacks:
+    - {"groq-gpt-oss-20b": ["azure-gpt-mini", "groq-gpt-oss-120b"]}
+    - {"azure-gpt-mini": ["groq-gpt-oss-120b"]}
+  content_policy_fallbacks:
+    - {"azure-gpt-mini": ["groq-gpt-oss-120b"]}
+
+  # ---- ROUTING GROUPS: a different strategy per model group ------------------
+  # cheap-chat uses latency-based routing (faster of Groq / Azure); every other
+  # model keeps the global simple-shuffle above. group_name is required.
+  routing_groups:
+    - group_name: latency-sensitive
+      models: ["cheap-chat"]
+      routing_strategy: latency-based-routing
+      routing_strategy_args: {ttl: 10, lowest_latency_buffer: 0.5}
+
+
+# =============================================================================
+# LITELLM SETTINGS: proxy-wide behavior
+# =============================================================================
+litellm_settings:
+  request_timeout: 60                           # per-model timeouts above override it
+  drop_params: true
+  turn_off_message_logging: true                # do NOT log prompt/response content
+  # OpenTelemetry tracing (exporter + endpoint come from OTEL_* env vars)
+  callbacks: ["otel"]
+
+# Per-callback settings. LiteLLM reads this key only at the TOP LEVEL of the config;
+# nested under litellm_settings it is ignored.
+callback_settings:
+  otel:
+    message_logging: false                      # keep prompt/response content out of traces
+
+
+# =============================================================================
+# GENERAL SETTINGS: auth, persistence, health checks
+# =============================================================================
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+  # Clients reach the proxy directly (Chainlit over the compose network, admins on
+  # localhost), so use the peer address for Admin UI sign-in limits. Behind a load
+  # balancer or ingress, list its CIDR ranges here instead.
+  trusted_proxy_ranges: []
+  # HEALTH-CHECK-DRIVEN ROUTING: probe every deployment in the background and route
+  # away from failing ones before a user request hits them. Each probe is a tiny
+  # call (max_tokens 16), so it costs tokens; claude-opus, mirror-demo and the
+  # virtual routers are excluded via disable_background_health_check.
+  # Note: a model group with only one deployment (gemma) is not removed; its short
+  # timeout and fallbacks handle outages instead.
+  background_health_checks: true
+  health_check_interval: 300                    # seconds between check cycles
+  enable_health_check_routing: true
+  health_check_ignore_transient_errors: true    # 429 / 408 never mark a deployment unhealthy
